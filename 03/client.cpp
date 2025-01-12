@@ -6,17 +6,101 @@
 #include <unistd.h>
 
 #define PORT 8080
-#define BUFFER_SIZE 1024
+#define k_max_msg 4096 // Maximum message length
 
 using namespace std;
+
+// Function to write all bytes to the socket
+static int32_t write_all(int fd, const char *buf, size_t n)
+{
+    while (n > 0)
+    {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0)
+        {
+            return -1;
+        }
+        n -= rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+// Function to read exactly 'n' bytes from the socket
+static int32_t read_full(int fd, char *buf, size_t n)
+{
+    while (n > 0)
+    {
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0)
+        {
+            return -1;
+        }
+        n -= rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+// function to send a query to the server and read its response
+static int32_t query(int fd, const char *text)
+{
+    uint32_t len = (uint32_t)strlen(text);
+    if (len > k_max_msg)
+    {
+        cout << "Message too long" << endl;
+        return -1;
+    }
+
+    // prepare the request with 4-byte length header + message
+    char wbuf[4 + k_max_msg];
+    memcpy(wbuf, &len, 4);       // Copy 4-byte length (assuming little-endian)
+    memcpy(&wbuf[4], text, len); // cpoy the message after the header
+
+    // send the request
+    if (int32_t err = write_all(fd, wbuf, 4 + len))
+    {
+        perror("write_all failed");
+        return err;
+    }
+
+    // read the 4-byte length header of the response
+    char rbuf[4 + k_max_msg + 1]; // Buffer to store response
+    int32_t err = read_full(fd, rbuf, 4);
+    if (err)
+    {
+        perror("read_full failed");
+        return err;
+    }
+
+    // Extract the length of the response message
+    memcpy(&len, rbuf, 4); // Assume little-endian
+    if (len > k_max_msg)
+    {
+        cout << "Response too long" << endl;
+        return -1;
+    }
+
+    // Read the response payload
+    err = read_full(fd, &rbuf[4], len);
+    if (err)
+    {
+        perror("read_full failed");
+        return err;
+    }
+
+    // Null-terminator the response and print it
+    rbuf[4 + len] = '\0';
+    printf("Server says: %s\n", &rbuf[4]);
+
+    return 0;
+}
 
 int main()
 {
     int client_fd, status;
     struct sockaddr_in server_addr, local_addr, remote_addr;
     socklen_t addr_len = sizeof(local_addr);
-    char buffer[BUFFER_SIZE] = {0};
-    const char *hello = "Hello from client";
 
     // creating socket
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -49,6 +133,7 @@ int main()
         perror("connect failed");
         return -1;
     }
+    printf("Connected to the server\n");
 
     // Get local address using getsockname()
     if (getsockname(client_fd, (struct sockaddr *)&local_addr, &addr_len) == 0)
@@ -66,23 +151,20 @@ int main()
                ntohs(remote_addr.sin_port));
     }
 
-    // Sending message to server
-    if (send(client_fd, hello, strlen(hello), 0) < 0)
-    {
-        perror("send failed");
-        return -1;
-    }
-    printf("Hello message sent\n");
+    // Send multiple queries to the server
+    int32_t err = query(client_fd, "hello1");
+    if (err)
+        goto L_DONE;
 
-    // Receiving response from server
-    ssize_t valread = recv(client_fd, buffer, BUFFER_SIZE - 1, 0);
-    if (valread < 0)
-    {
-        perror("recv failed");
-        return -1;
-    }
-    buffer[valread] = '\0'; // Null-terminate the received string
-    printf("Server says: %s\n", buffer);
+    err = query(client_fd, "hello2");
+    if (err)
+        goto L_DONE;
+
+    err = query(client_fd, "hello3");
+    if (err)
+        goto L_DONE;
+
+L_DONE:
 
     // Closing the socket
     close(client_fd);
