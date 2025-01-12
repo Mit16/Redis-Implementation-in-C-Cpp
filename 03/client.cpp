@@ -13,7 +13,8 @@ using namespace std;
 int main()
 {
     int client_fd, status;
-    struct sockaddr_in address;
+    struct sockaddr_in server_addr, local_addr, remote_addr;
+    socklen_t addr_len = sizeof(local_addr);
     char buffer[BUFFER_SIZE] = {0};
     const char *hello = "Hello from client";
 
@@ -25,24 +26,44 @@ int main()
         exit(EXIT_FAILURE);
     }
 
-    // setting up server address
-    address.sin_family = AF_INET;
-    address.sin_port = htons(PORT);
+    // Specify local address using bind()
+    // struct sockaddr_in local_addr = {};
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(0);                      // OS picks the port
+    local_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Use localhost
 
-    // converting IP address to binary form
-    if (inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) <= 0)
+    if (bind(client_fd, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0)
     {
-        printf(
-            "\nInvalid address/ Address not supported \n");
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set up server address
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(8080);
+    inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
+
+    // Connect to server
+    if (connect(client_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    {
+        perror("connect failed");
         return -1;
     }
 
-    // connecting to server
-    status = connect(client_fd, (struct sockaddr *)&address, sizeof(address));
-    if (status < 0)
+    // Get local address using getsockname()
+    if (getsockname(client_fd, (struct sockaddr *)&local_addr, &addr_len) == 0)
     {
-        printf("Connection Failed");
-        return -1;
+        printf("Local IP: %s, Port: %d\n",
+               inet_ntoa(local_addr.sin_addr),
+               ntohs(local_addr.sin_port));
+    }
+
+    // Get server (remote) address using getpeername()
+    if (getpeername(client_fd, (struct sockaddr *)&remote_addr, &addr_len) == 0)
+    {
+        printf("Connected to Server - IP: %s, Port: %d\n",
+               inet_ntoa(remote_addr.sin_addr),
+               ntohs(remote_addr.sin_port));
     }
 
     // Sending message to server
