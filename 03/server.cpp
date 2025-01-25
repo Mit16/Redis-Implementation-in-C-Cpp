@@ -10,12 +10,16 @@
 #include <sys/socket.h>
 #include <cstddef>
 #include <map>
+#include "hashtable.h"
 
 using namespace std;
 
 #define PORT 8080
 const size_t k_max_msg = 32 << 20;    // 32 MB
 const size_t k_max_args = 200 * 1000; // Maximum number of arguments in a request
+
+#define container_of(ptr, T, member) \
+    ((T *)((char *)ptr - offsetof(T, member)))
 
 // Connection state
 struct Conn
@@ -165,42 +169,126 @@ struct Response
     vector<uint8_t> data;
 };
 
-// Global key-value store (placeholder)
-static map<string, string> g_data;
+// global states
+static struct
+{
+    HMap db; // top-level hashtable
+} g_data;
+
+// KV pair for the top-level hashtable
+struct Entry
+{
+    struct HNode node; // hashtable node
+    string key;
+    string val;
+};
+
+// equality comparison for 'struct Entry'
+static bool entry_eq(HNode *lhs, HNode *rhs)
+{
+    struct Entry *le = container_of(lhs, struct Entry, node);
+    struct Entry *re = container_of(rhs, struct Entry, node);
+    return le->key == re->key;
+}
+
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len)
+{
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(vector<string> &cmd, Response &out)
+{
+    // a dummy `Entry` just for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node)
+    {
+        out.status = RES_NX;
+        out.data.assign("Key not found", "Key not found" + 13); // response message
+        return;
+    }
+    // copy the value
+    const string &val = container_of(node, Entry, node)->val;
+    assert(val.size() <= k_max_msg);
+    out.data.assign(val.begin(), val.end());
+    out.status = RES_OK;
+}
+
+static void do_set(vector<string> &cmd, Response &out)
+{
+    // a dummy `Entry` for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        // found, update the value
+        container_of(node, Entry, node)->val.swap(cmd[2]);
+    }
+    else
+    {
+        // not found, allocate & insert a new pair
+        Entry *ent = new Entry();
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->val.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+
+    // Set the response status to OK
+    out.status = RES_OK;
+    out.data.assign("OK", "OK" + 2); // response message
+}
+
+static void do_del(vector<string> &cmd, Response &out)
+{
+    // a dummy `Entry` for the lookup
+    Entry key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+
+    // hashtable delete
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    if (node)
+    {
+        // deallocating the pair
+        delete container_of(node, Entry, node);
+        out.status = RES_OK;
+        out.data.assign("OK", "OK" + 2); //  response message
+    }
+    else
+    {
+        out.status = RES_NX;                                    // Key not found
+        out.data.assign("Key not found", "Key not found" + 13); // response message
+    }
+}
 
 // Process a command and generate a response
 static void do_request(vector<string> &cmd, Response &out)
 {
     if (cmd.size() == 2 && cmd[0] == "get")
     {
-        auto it = g_data.find(cmd[1]);
-        if (it == g_data.end())
-        {
-            out.status = RES_NX; // Key not found
-            out.data.assign("Key not found", "Key not found" + 13);
-            return;
-        }
-        const string &val = it->second;
-        out.data.assign(val.begin(), val.end());
+        do_get(cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "set")
     {
-        g_data[cmd[1]] = cmd[2];
-        out.status = RES_OK;
-        out.data.assign("OK", "OK" + 2);
+        do_set(cmd, out);
     }
     else if (cmd.size() == 2 && cmd[0] == "del")
     {
-        if (g_data.erase(cmd[1]) > 0)
-        {
-            out.status = RES_OK;
-            out.data.assign("OK", "OK" + 2);
-        }
-        else
-        {
-            out.status = RES_NX; // Key not found
-            out.data.assign("Key not found", "Key not found" + 13);
-        }
+        do_del(cmd, out);
     }
     else
     {
