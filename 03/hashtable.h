@@ -30,3 +30,5 @@ void hm_insert(HMap *hmap, HNode *node);
 HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 void hm_clear(HMap *hmap);
 size_t hm_size(HMap *hmap);
+// invoke callback on each node until it return false
+void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg);

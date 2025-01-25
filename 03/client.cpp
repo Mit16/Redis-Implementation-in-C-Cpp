@@ -12,8 +12,19 @@ const size_t k_max_msg = 32 << 20; // 32 MB
 
 using namespace std;
 
+enum
+{
+    TAG_NIL = 0, // nil
+    TAG_ERR = 1, // Error code + msg
+    TAG_STR = 2, // string
+    TAG_INT = 3, // int64
+    TAG_DBL = 4, // double
+    TAG_ARR = 5, // array
+};
+
 // Logging and error handling
-static void msg(const char *msg)
+static void
+msg(const char *msg)
 {
     cerr << msg << endl;
 }
@@ -60,125 +71,6 @@ static int32_t read_full(int fd, void *buf, size_t n)
     return 0;
 }
 
-// Function to send a Redis-style request
-// static int32_t send_request(int fd, const char *text)
-// {
-//     uint32_t len = (uint32_t)strlen(text);
-//     if (len == 0 || len > k_max_msg)
-//     {
-//         msg("Message length invalid");
-//         return -1;
-//     }
-
-//     // Format the request in Redis protocol: $<len>\r\n<text>\r\n
-//     char wbuf[64 + k_max_msg]; // Increased buffer size to handle large inputs
-//     int header_len = snprintf(wbuf, sizeof(wbuf), "$%u\r\n", len);
-//     if (header_len < 0 || header_len >= sizeof(wbuf))
-//     {
-//         msg("Failed to format header");
-//         return -1;
-//     }
-
-//     // Copy the text and append \r\n at the end
-//     memcpy(wbuf + header_len, text, len);
-//     memcpy(wbuf + header_len + len, "\r\n", 2);
-
-//     // Send the entire formatted request
-//     size_t total_len = header_len + len + 2; // Total length of the request
-//     if (int32_t err = write_all(fd, wbuf, total_len))
-//     {
-//         msg("write_all failed");
-//         return err;
-//     }
-
-//     return 0;
-// }
-
-// // Function to read a Redis-style response
-// static int32_t read_response(int fd)
-// {
-//     char rbuf[4 + k_max_msg + 1]; // Buffer to store response
-//     errno = 0;
-
-//     // Step 1: Read the '$' sign
-//     int32_t err = read_full(fd, rbuf, 1);
-//     if (err || rbuf[0] != '$')
-//     {
-//         msg("Invalid Redis protocol: missing '$' sign");
-//         return -1;
-//     }
-
-//     // Step 2: Read the length prefix (variable-length decimal number)
-//     char len_buf[32];
-//     size_t i = 0;
-//     while (i < sizeof(len_buf) - 1)
-//     {
-//         err = read_full(fd, &len_buf[i], 1);
-//         if (err)
-//         {
-//             msg("read_full failed");
-//             return err;
-//         }
-//         if (len_buf[i] == '\r')
-//         {
-//             len_buf[i] = '\0'; // Null-terminate the length string
-//             break;
-//         }
-//         i++;
-//     }
-
-//     // Step 3: Read the newline after the length prefix
-//     char nl;
-//     err = read_full(fd, &nl, 1);
-//     if (err || nl != '\n')
-//     {
-//         msg("Invalid Redis protocol: missing newline after length");
-//         return -1;
-//     }
-
-//     // Convert length to integer
-//     uint32_t len = atoi(len_buf);
-//     if (len == 0 || len > k_max_msg)
-//     {
-//         msg("Invalid or too long message length");
-//         return -1;
-//     }
-
-//     // Step 4: Read the actual bulk string message
-//     err = read_full(fd, rbuf, len);
-//     if (err)
-//     {
-//         msg("read_full failed");
-//         return err;
-//     }
-//     rbuf[len] = '\0'; // Null-terminate the message
-//     printf("Server says: %s\n", rbuf);
-
-//     // Step 5: Read the trailing \r\n
-//     err = read_full(fd, rbuf, 2);
-//     if (err || rbuf[0] != '\r' || rbuf[1] != '\n')
-//     {
-//         msg("Invalid Redis protocol: missing trailing \\r\\n");
-//         return -1;
-//     }
-
-//     return 0;
-// }
-
-// // Function to send a query to the server and read its response
-// static int32_t query(int fd, const char *text)
-// {
-//     // Send the request in Redis protocol format
-//     if (int32_t err = send_request(fd, text))
-//     {
-//         return err;
-//     }
-
-//     // Read the response in Redis protocol format
-//     return read_response(fd);
-// }
-// Send a request to the server
-
 // Send a request to the server
 static int32_t send_request(int fd, const vector<string> &cmd)
 {
@@ -219,6 +111,109 @@ static int32_t send_request(int fd, const vector<string> &cmd)
 }
 
 // Read and parse the server response
+
+static int32_t print_response(const uint8_t *data, size_t size)
+{
+    if (size < 1)
+    {
+        msg("Bad response");
+        return -1;
+    }
+
+    switch (data[0])
+    {
+    case 0: // TAG_NIL
+        cout << "(nil)\n";
+        return 1;
+    case 1: // TAG_ERR
+        if (size < 9)
+        {
+            msg("Bad response");
+            return -1;
+        }
+        {
+            int32_t code = 0;
+            uint32_t len = 0;
+            memcpy(&code, &data[1], 4);
+            memcpy(&len, &data[5], 4);
+            if (size < 9 + len)
+            {
+                msg("Bad response");
+                return -1;
+            }
+            printf("(err) %d %.*s\n", code, len, &data[9]);
+            return 9 + len;
+        }
+    case 2: // TAG_STR
+        if (size < 5)
+        {
+            msg("Bad response");
+            return -1;
+        }
+        {
+            uint32_t len = 0;
+            memcpy(&len, &data[1], 4);
+            if (size < 5 + len)
+            {
+                msg("Bad response");
+                return -1;
+            }
+            printf("(str) %.*s\n", len, &data[5]);
+            return 5 + len;
+        }
+    case 3: // TAG_INT
+        if (size < 9)
+        {
+            msg("Bad response");
+            return -1;
+        }
+        {
+            int64_t val = 0;
+            memcpy(&val, &data[1], 8);
+            printf("(int) %ld\n", val);
+            return 9;
+        }
+    case 4: // TAG_DBL
+        if (size < 9)
+        {
+            msg("Bad response");
+            return -1;
+        }
+        {
+            double val = 0;
+            memcpy(&val, &data[1], 8);
+            printf("(dbl) %g\n", val);
+            return 9;
+        }
+    case 5: // TAG_ARR
+        if (size < 5)
+        {
+            msg("Bad response");
+            return -1;
+        }
+        {
+            uint32_t len = 0;
+            memcpy(&len, &data[1], 4);
+            printf("(arr) len=%u\n", len);
+            size_t arr_bytes = 5;
+            for (uint32_t i = 0; i < len; ++i)
+            {
+                int32_t rv = print_response(&data[arr_bytes], size - arr_bytes);
+                if (rv < 0)
+                {
+                    return rv;
+                }
+                arr_bytes += (size_t)rv;
+            }
+            printf("(arr) end\n");
+            return (int32_t)arr_bytes;
+        }
+    default:
+        msg("Bad response");
+        return -1;
+    }
+}
+
 static int32_t read_response(int fd)
 {
     // Step 1: Read response length (4 bytes)
@@ -243,25 +238,14 @@ static int32_t read_response(int fd)
         return -1;
     }
 
-    // Step 3: Parse the response
-    uint32_t status = 0;
-    memcpy(&status, buf.data(), 4);
-
-    if (status == 0)
-    { // RES_OK
-        string data(buf.begin() + 4, buf.end());
-        cout << "Response: " << data << endl;
+    // Step 3: Print the response
+    int32_t rv = print_response(buf.data(), len);
+    if (rv > 0 && (uint32_t)rv != len)
+    {
+        msg("Bad response");
+        return -1;
     }
-    else if (status == 2)
-    { // RES_NX
-        cout << "Response: Key not found" << endl;
-    }
-    else
-    { // RES_ERR
-        cout << "Response: Error" << endl;
-    }
-
-    return 0;
+    return rv;
 }
 
 // Query the server with a command
@@ -272,9 +256,22 @@ static int32_t query(int fd, const vector<string> &cmd)
         msg("Failed to send request");
         return -1;
     }
+
+    // If the command is "quit", expect a response and then close the connection
+    if (cmd.size() == 1 && cmd[0] == "quit")
+    {
+        int32_t rv = read_response(fd);
+        if (rv < 0)
+        {
+            msg("Failed to read response");
+            return -1;
+        }
+        close(fd); // Close the connection
+        exit(0);   // Exit the client
+    }
+
     return read_response(fd);
 }
-
 int main(int argc, char **argv)
 {
 
@@ -340,23 +337,31 @@ int main(int argc, char **argv)
 
         // Parse command into arguments
         vector<string> cmd;
-        size_t pos = 0, space;
-        while ((space = input.find(' ', pos)) != string::npos)
+        size_t pos = 0;
+        while (pos < input.size())
         {
-            cmd.push_back(input.substr(pos, space - pos));
-            pos = space + 1;
+            if (input[pos] == ' ')
+            {
+                pos++;
+            }
+            else if (input[pos] == '"')
+            {
+                size_t end = input.find('"', pos + 1);
+                if (end == string::npos)
+                {
+                    msg("Unmatched quote in command");
+                    continue;
+                }
+                cmd.push_back(input.substr(pos + 1, end - pos - 1));
+                pos = end + 1;
+            }
+            else
+            {
+                size_t end = input.find(' ', pos);
+                cmd.push_back(input.substr(pos, end - pos));
+                pos = end;
+            }
         }
-        if (pos < input.size())
-        {
-            cmd.push_back(input.substr(pos));
-        }
-
-        if (cmd.empty())
-            continue;
-
-        // Special case: quit
-        if (cmd[0] == "quit")
-            break;
 
         // Send command and process response
         if (query(client_fd, cmd) < 0)
