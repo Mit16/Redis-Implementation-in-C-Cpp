@@ -1,7 +1,10 @@
+#ifndef HASHTABLE_H
+#define HASHTABLE_H
+
 #include <stddef.h>
 #include <stdint.h>
 
-// hashtable node,should be embedded into the payload
+// hashtable node, should be embedded into the payload
 struct HNode
 {
     HNode *next = NULL;
@@ -17,7 +20,7 @@ struct HTab
 };
 
 // the real hashtable interface.
-// it uses 2 hashtables for progressive rehasing.
+// it uses 2 hashtables for progressive rehashing.
 struct HMap
 {
     HTab newer;
@@ -30,5 +33,7 @@ void hm_insert(HMap *hmap, HNode *node);
 HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *));
 void hm_clear(HMap *hmap);
 size_t hm_size(HMap *hmap);
-// invoke callback on each node until it return false
+// invoke callback on each node until it returns false
 void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg);
+
+#endif // HASHTABLE_H

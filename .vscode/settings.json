@@ -1,6 +1,14 @@
 {
     "files.associations": {
         "*.ejs": "html",
-        "cstddef": "cpp"
+        "cstddef": "cpp",
+        "bit": "cpp",
+        "compare": "cpp",
+        "string": "cpp",
+        "optional": "cpp",
+        "limits": "cpp",
+        "memory": "cpp",
+        "new": "cpp",
+        "functional": "cpp"
     }
 }
