@@ -26,7 +26,9 @@ enum
 static void
 msg(const char *msg)
 {
+#ifdef DEBUG
     cerr << msg << endl;
+#endif
 }
 
 static void die(const char *msg)
@@ -309,22 +311,44 @@ int main(int argc, char **argv)
     {
         die("connect failed");
     }
+#ifdef DEBUG
     printf("Connected to the server\n");
-
+#endif
     // Get local address using getsockname()
     if (getsockname(client_fd, (struct sockaddr *)&local_addr, &addr_len) == 0)
     {
+#ifdef DEBUG
         printf("Local IP: %s, Port: %d\n",
                inet_ntoa(local_addr.sin_addr),
                ntohs(local_addr.sin_port));
+#endif
     }
 
     // Get server (remote) address using getpeername()
     if (getpeername(client_fd, (struct sockaddr *)&remote_addr, &addr_len) == 0)
     {
+#ifdef DEBUG
         printf("Connected to Server - IP: %s, Port: %d\n",
                inet_ntoa(remote_addr.sin_addr),
                ntohs(remote_addr.sin_port));
+#endif
+    }
+    // Handle CLI arguments as single-shot command
+    if (argc > 1)
+    {
+        vector<string> cmd;
+        for (int i = 1; i < argc; ++i)
+        {
+            cmd.emplace_back(argv[i]);
+        }
+
+        if (query(client_fd, cmd) < 0)
+        {
+            msg("Query failed");
+        }
+
+        close(client_fd);
+        return 0;
     }
 
     // Interactive client loop

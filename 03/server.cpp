@@ -92,6 +92,8 @@ struct Conn
     // timer
     uint64_t last_active_ms = 0;
     DList idle_node;
+
+    HMap db;
 };
 
 // global states
@@ -325,12 +327,15 @@ struct Entry
     std::string str;
     std::string val; // Add this member
     ZSet zset;       // Use Zset instead of ZSet
+
+    Conn *owner_conn = nullptr;
 };
 
-static Entry *entry_new(uint32_t type)
+static Entry *entry_new(uint32_t type, Conn *conn)
 {
     Entry *ent = new Entry();
     ent->type = type;
+    ent->owner_conn = conn;
     return ent;
 }
 
@@ -342,6 +347,7 @@ static void entry_del_sync(Entry *ent)
     {
         zset_clear(&ent->zset);
     }
+    ent->owner_conn = nullptr; // <- Clear this
     delete ent;
 }
 
@@ -381,14 +387,14 @@ static bool entry_eq(HNode *node, HNode *key)
     return ent->key == keydata->key;
 }
 
-static void do_get(vector<string> &cmd, Buffer &out)
+static void do_get(Conn *conn, vector<string> &cmd, Buffer &out)
 {
     // a dummy `Entry` just for the lookup
     LookupKey key;
     key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     // hashtable lookup
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_lookup(&conn->db, &key.node, &entry_eq);
     if (!node)
     {
         return out_nil(out);
@@ -402,7 +408,7 @@ static void do_get(vector<string> &cmd, Buffer &out)
     return out_str(out, ent->str.data(), ent->str.size());
 }
 
-static void do_set(vector<string> &cmd, Buffer &out)
+static void do_set(Conn *conn, vector<string> &cmd, Buffer &out)
 {
     // a dummy `Entry` for the lookup
     LookupKey key;
@@ -410,7 +416,7 @@ static void do_set(vector<string> &cmd, Buffer &out)
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     // hashtable lookup
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_lookup(&conn->db, &key.node, &entry_eq);
     if (node)
     {
         // found, update the value
@@ -424,26 +430,26 @@ static void do_set(vector<string> &cmd, Buffer &out)
     else
     {
         // not found, allocate & insert a new pair
-        Entry *ent = new Entry();
+        Entry *ent = entry_new(T_STR, conn);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
         ent->type = T_STR;
         ent->str.swap(cmd[2]); // you store string value here
-        hm_insert(&g_data.db, &ent->node);
+        hm_insert(&conn->db, &ent->node);
     }
 
     // Return "OK" as a response
     return out_str(out, "1", 1);
 }
 
-static void do_del(vector<string> &cmd, Buffer &out)
+static void do_del(Conn *conn, vector<string> &cmd, Buffer &out)
 {
     // a dummy struct just for the lookup
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     // hashtable delete
-    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_delete(&conn->db, &key.node, &entry_eq);
     if (node)
     {
         entry_del(container_of(node, Entry, node));
@@ -507,7 +513,7 @@ static bool str2int(const std::string &s, int64_t &out)
 }
 
 // PEXPIRE key ttl_ms
-static void do_expire(std::vector<std::string> &cmd, Buffer &out)
+static void do_expire(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
     int64_t ttl_ms = 0;
     if (!str2int(cmd[2], ttl_ms))
@@ -518,7 +524,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out)
     key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_lookup(&conn->db, &key.node, &entry_eq);
     if (node)
     {
         Entry *ent = container_of(node, Entry, node);
@@ -528,14 +534,14 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out)
 }
 
 // PTTL key
-static void do_ttl(std::vector<std::string> &cmd, Buffer &out)
+static void do_ttl(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
     LookupKey key;
     key.key = cmd[1]; // instead of swap(cmd[1])
 
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *node = hm_lookup(&conn->db, &key.node, &entry_eq);
     if (!node)
     {
         return out_int(out, -2); // not found
@@ -560,10 +566,10 @@ static bool cb_keys(HNode *node, void *arg)
     return true;
 }
 
-static void do_keys(vector<string> &, Buffer &out)
+static void do_keys(Conn *conn, vector<string> &, Buffer &out)
 {
-    out_arr(out, (uint32_t)hm_size(&g_data.db));
-    hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+    out_arr(out, (uint32_t)hm_size(&conn->db));
+    hm_foreach(&conn->db, &cb_keys, (void *)&out);
 }
 
 static bool str2dbl(const std::string &s, double &out)
@@ -574,7 +580,7 @@ static bool str2dbl(const std::string &s, double &out)
 }
 
 // zadd zset score name
-static void do_zadd(std::vector<std::string> &cmd, Buffer &out)
+static void do_zadd(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
     double score = 0;
     if (!str2dbl(cmd[2], score))
@@ -586,15 +592,15 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out)
     LookupKey key;
     key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *hnode = hm_lookup(&conn->db, &key.node, &entry_eq);
 
     Entry *ent = NULL;
     if (!hnode)
     { // insert a new key
-        ent = entry_new(T_ZSET);
+        ent = entry_new(T_ZSET, conn);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
-        hm_insert(&g_data.db, &ent->node);
+        hm_insert(&conn->db, &ent->node);
     }
     else
     { // check the existing key
@@ -613,12 +619,12 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out)
 
 static const ZSet k_empty_zset;
 
-static ZSet *expect_zset(std::string &s)
+static ZSet *expect_zset(Conn *conn, std::string &s)
 {
     LookupKey key;
     key.key.swap(s);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    HNode *hnode = hm_lookup(&conn->db, &key.node, &entry_eq);
     if (!hnode)
     { // a non-existent key is treated as an empty zset
         return (ZSet *)&k_empty_zset;
@@ -628,9 +634,9 @@ static ZSet *expect_zset(std::string &s)
 }
 
 // zrem zset name
-static void do_zrem(std::vector<std::string> &cmd, Buffer &out)
+static void do_zrem(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
-    ZSet *zset = expect_zset(cmd[1]);
+    ZSet *zset = expect_zset(conn, cmd[1]);
     if (!zset)
     {
         return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -646,9 +652,9 @@ static void do_zrem(std::vector<std::string> &cmd, Buffer &out)
 }
 
 // zscore zset name
-static void do_zscore(std::vector<std::string> &cmd, Buffer &out)
+static void do_zscore(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
-    ZSet *zset = expect_zset(cmd[1]);
+    ZSet *zset = expect_zset(conn, cmd[1]);
     if (!zset)
     {
         return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -660,7 +666,7 @@ static void do_zscore(std::vector<std::string> &cmd, Buffer &out)
 }
 
 // zquery zset score name offset limit
-static void do_zquery(std::vector<std::string> &cmd, Buffer &out)
+static void do_zquery(Conn *conn, std::vector<std::string> &cmd, Buffer &out)
 {
     // parse args
     double score = 0;
@@ -676,7 +682,7 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out)
     }
 
     // get the zset
-    ZSet *zset = expect_zset(cmd[1]);
+    ZSet *zset = expect_zset(conn, cmd[1]);
     if (!zset)
     {
         return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -704,47 +710,47 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out)
 }
 
 // Process a command and generate a response
-static void do_request(vector<string> &cmd, Buffer &out)
+static void do_request(Conn *conn, vector<string> &cmd, Buffer &out)
 {
     if (cmd.size() == 2 && cmd[0] == "get")
     {
-        do_get(cmd, out);
+        do_get(conn, cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "set")
     {
-        do_set(cmd, out);
+        do_set(conn, cmd, out);
     }
     else if (cmd.size() == 2 && cmd[0] == "del")
     {
-        do_del(cmd, out);
+        do_del(conn, cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "pexpire")
     {
-        return do_expire(cmd, out);
+        return do_expire(conn, cmd, out);
     }
     else if (cmd.size() == 2 && cmd[0] == "pttl")
     {
-        return do_ttl(cmd, out);
+        return do_ttl(conn, cmd, out);
     }
     else if (cmd.size() == 1 && cmd[0] == "keys")
     {
-        do_keys(cmd, out);
+        do_keys(conn, cmd, out);
     }
     else if (cmd.size() == 4 && cmd[0] == "zadd")
     {
-        return do_zadd(cmd, out);
+        return do_zadd(conn, cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "zrem")
     {
-        return do_zrem(cmd, out);
+        return do_zrem(conn, cmd, out);
     }
     else if (cmd.size() == 3 && cmd[0] == "zscore")
     {
-        return do_zscore(cmd, out);
+        return do_zscore(conn, cmd, out);
     }
     else if (cmd.size() == 6 && cmd[0] == "zquery")
     {
-        return do_zquery(cmd, out);
+        return do_zquery(conn, cmd, out);
     }
     else if (cmd.size() == 1 && cmd[0] == "quit")
     {
@@ -833,9 +839,9 @@ static bool try_one_request(Conn *conn)
 
     // Process the command and generate a response
     size_t header_pos = 0;
-    conn->outgoing.clear();  // start fresh for new response
+    conn->outgoing.clear(); // start fresh for new response
     response_begin(conn->outgoing, &header_pos);
-    do_request(cmd, conn->outgoing);
+    do_request(conn, cmd, conn->outgoing);
     response_end(conn->outgoing, header_pos);
 
     // Remove the processed message from the incoming buffer
@@ -988,7 +994,13 @@ static void process_timers()
             continue; // skip stale entry
         }
         Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
-        HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
+        Conn *owner = ent->owner_conn;
+        if (!owner)
+        {
+            heap_delete(heap, 0);
+            continue; // stale or unbound
+        }
+        HNode *node = hm_delete(&owner->db, &ent->node, &hnode_same);
         assert(node == &ent->node);
         fprintf(stderr, "key expired: %s\n", ent->key.c_str());
         // Proper deletion also sets heap_idx = -1
