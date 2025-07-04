@@ -104,7 +104,7 @@ static struct
     DList idle_list;
     // timers for idle connections
     std::vector<HeapItem> heap;
-     // the thread pool
+    // the thread pool
     TheadPool thread_pool;
 } g_data;
 
@@ -127,23 +127,30 @@ static Conn *handle_accept(int fd)
     Conn *conn = new Conn();
     conn->fd = connfd;
     conn->want_read = true; // Start by reading the first request
-
+    conn->want_write = false;
+    conn->want_close = false;
+    conn->last_active_ms = get_monotonic_msec();
     dlist_insert_before(&g_data.idle_list, &conn->idle_node);
 
-    // put it into the map
-    if (g_data.fd2conn.size() <= (size_t)conn->fd)
-    {
-        g_data.fd2conn.resize(conn->fd + 1);
-    }
-    assert(!g_data.fd2conn[conn->fd]);
-    g_data.fd2conn[conn->fd] = conn;
+    fprintf(stderr, "[handle_accept] New connection: fd=%d\n", connfd);
     return conn;
 }
 
 static void conn_destroy(Conn *conn)
 {
-    (void)close(conn->fd);
-    g_data.fd2conn[conn->fd] = NULL;
+    int fd = conn->fd;
+    fprintf(stderr, "[conn_destroy] Destroying connection: fd=%d\n", conn->fd);
+
+    if (fd >= 0)
+    {
+        close(fd);
+        if ((size_t)fd < g_data.fd2conn.size())
+        {
+            g_data.fd2conn[fd] = nullptr;
+        }
+    }
+
+    conn->fd = -1;
     dlist_detach(&conn->idle_node);
     delete conn;
 }
@@ -198,6 +205,13 @@ static int32_t parse_req(const uint8_t *data, size_t size, vector<string> &out)
             return -1;
         }
     }
+
+    for (const auto &s : out)
+    {
+        fprintf(stderr, " '%s'", s.c_str());
+    }
+    fprintf(stderr, "\n");
+
     if (data != end)
     {
         return -1; // Trailing garbage
@@ -212,6 +226,7 @@ enum
     ERR_TOO_BIG = 2, // response too big
     ERR_BAD_TYP = 3, // unexpected value type
     ERR_BAD_ARG = 4, // bad arguments
+    ERR_BAD_REQ = 5,
 };
 
 enum
@@ -376,7 +391,7 @@ static void do_get(vector<string> &cmd, Buffer &out)
 {
     // a dummy `Entry` just for the lookup
     LookupKey key;
-    key.key.swap(cmd[1]);
+    key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     // hashtable lookup
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
@@ -388,6 +403,8 @@ static void do_get(vector<string> &cmd, Buffer &out)
     Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_STR)
     {
+        fprintf(stderr, "[do_get] key=%s, type=%u\n", cmd[1].c_str(), ent->type);
+
         return out_err(out, ERR_BAD_TYP, "not a string value");
     }
     return out_str(out, ent->str.data(), ent->str.size());
@@ -408,6 +425,8 @@ static void do_set(vector<string> &cmd, Buffer &out)
         Entry *ent = container_of(node, Entry, node);
         if (ent->type != T_STR)
         {
+            fprintf(stderr, "[do_set] key=%s existing type=%u\n", cmd[1].c_str(), ent->type);
+
             return out_err(out, ERR_BAD_TYP, "a non-string value exists");
         }
         ent->str.swap(cmd[2]);
@@ -418,12 +437,13 @@ static void do_set(vector<string> &cmd, Buffer &out)
         Entry *ent = new Entry();
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
-        ent->val.swap(cmd[2]);
+        ent->type = T_STR;
+        ent->str.swap(cmd[2]); // you store string value here
         hm_insert(&g_data.db, &ent->node);
     }
 
     // Return "OK" as a response
-    return out_str(out, "OK", 2);
+    return out_str(out, "1", 1);
 }
 
 static void do_del(vector<string> &cmd, Buffer &out)
@@ -505,7 +525,7 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out)
         return out_err(out, ERR_BAD_ARG, "expect int64");
     }
     LookupKey key;
-    key.key.swap(cmd[1]);
+    key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
@@ -521,7 +541,8 @@ static void do_expire(std::vector<std::string> &cmd, Buffer &out)
 static void do_ttl(std::vector<std::string> &cmd, Buffer &out)
 {
     LookupKey key;
-    key.key.swap(cmd[1]);
+    key.key = cmd[1]; // instead of swap(cmd[1])
+
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
 
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
@@ -549,7 +570,7 @@ static bool cb_keys(HNode *node, void *arg)
     return true;
 }
 
-static bool do_keys(vector<string> &, Buffer &out)
+static void do_keys(vector<string> &, Buffer &out)
 {
     out_arr(out, (uint32_t)hm_size(&g_data.db));
     hm_foreach(&g_data.db, &cb_keys, (void *)&out);
@@ -573,9 +594,12 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out)
 
     // look up or create the zset
     LookupKey key;
-    key.key.swap(cmd[1]);
+    key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    fprintf(stderr, "[do_zadd] Adding to zset %s: name=%s, score=%f\n",
+            cmd[1].c_str(), cmd[3].c_str(), score);
 
     Entry *ent = NULL;
     if (!hnode)
@@ -737,8 +761,8 @@ static void do_request(vector<string> &cmd, Buffer &out)
     }
     else if (cmd.size() == 1 && cmd[0] == "quit")
     {
-        // Handle the quit command
-        out_str(out, "BYE", 3); // Send a goodbye message
+        out_str(out, "BYE", 3);
+        // conn->want_close = true;
     }
     else
     {
@@ -775,6 +799,7 @@ static void response_end(Buffer &out, size_t header)
 // Process one request if there is enough data
 static bool try_one_request(Conn *conn)
 {
+
     // Try to parse the protocol: message header
     if (conn->incoming.size() < 4)
     {
@@ -785,8 +810,16 @@ static bool try_one_request(Conn *conn)
     if (len > k_max_msg)
     {
         msg("too long");
+        size_t header_pos = 0;
+        response_begin(conn->outgoing, &header_pos);
+        out_err(conn->outgoing, ERR_BAD_REQ, "Message too long");
+        response_end(conn->outgoing, header_pos);
+
+        buf_consume(conn->incoming, 4); // consume just the header
+        conn->want_read = false;
+        conn->want_write = true;
         conn->want_close = true;
-        return false; // Want close
+        return false;
     }
     // Message body
     if (4 + len > conn->incoming.size())
@@ -794,14 +827,21 @@ static bool try_one_request(Conn *conn)
         return false; // Need more data
     }
     const uint8_t *request = &conn->incoming[4];
-
     // Parse the request into a list of strings
     vector<string> cmd;
     if (parse_req(request, len, cmd) < 0)
     {
         msg("bad request");
-        conn->want_close = true;
-        return false; // Want close
+        size_t header_pos = 0;
+        response_begin(conn->outgoing, &header_pos);
+        out_err(conn->outgoing, ERR_BAD_REQ, "Bad request");
+        response_end(conn->outgoing, header_pos);
+
+        buf_consume(conn->incoming, 4 + len); // still consume the bad input
+        conn->want_read = false;
+        conn->want_write = true;
+        conn->want_close = true; // still close after responding
+        return false;
     }
 
     // Process the command and generate a response
@@ -821,6 +861,7 @@ static void handle_read(Conn *conn)
     // Perform a non-blocking read
     uint8_t buf[4096];
     ssize_t rv = read(conn->fd, buf, sizeof(buf));
+
     if (rv < 0 && errno == EAGAIN)
     {
         return; // Not ready yet
@@ -859,6 +900,7 @@ static void handle_write(Conn *conn)
 {
     // Perform a non-blocking write
     ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
     if (rv < 0 && errno == EAGAIN)
     {
         return; // Not ready yet
@@ -881,7 +923,7 @@ static void handle_write(Conn *conn)
     }
 }
 
-const uint64_t k_idle_timeout_ms = 5 * 1000;
+const uint64_t k_idle_timeout_ms = 60 * 1000;
 
 static uint32_t next_timer_ms()
 {
@@ -929,25 +971,30 @@ static void process_timers()
             break; // not expired
         }
         fprintf(stderr, "removing idle connection: %d\n", conn->fd);
+        // Protect fd2conn and conn->fd
+        if (conn->fd >= 0 && (size_t)conn->fd < g_data.fd2conn.size())
+        {
+            g_data.fd2conn[conn->fd] = nullptr;
+        }
         conn_destroy(conn);
     }
 
     // TTL expiration via heap
     const size_t k_max_works = 2000;
     size_t nworks = 0;
-    const std::vector<HeapItem> &heap = g_data.heap;
+    std::vector<HeapItem> &heap = g_data.heap;
     while (!heap.empty() && heap[0].val < now_ms)
     {
         if (!heap[0].ref || *(heap[0].ref) == (size_t)-1)
         {
-            heap_delete(g_data.heap, 0);
+            heap_delete(heap, 0);
             continue; // skip stale entry
         }
-        Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
+        Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
         HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
         assert(node == &ent->node);
         fprintf(stderr, "key expired: %s\n", ent->key.c_str());
-        // delete the key
+        // Proper deletion also sets heap_idx = -1
         entry_del(ent);
         if (nworks++ >= k_max_works)
         {
@@ -1054,7 +1101,13 @@ int main()
             {
                 continue;
             }
-            Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            // Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            // Conn *conn = (poll_args[i].fd < (int)g_data.fd2conn.size()) ? g_data.fd2conn[poll_args[i].fd] : nullptr;
+            int fd = poll_args[i].fd;
+            Conn *conn = (fd >= 0 && (size_t)fd < g_data.fd2conn.size()) ? g_data.fd2conn[fd] : nullptr;
+            if (!conn)
+                continue; // skip invalid or destroyed fds
+
             // update the idle timer by moving conn to the end of the list
             conn->last_active_ms = get_monotonic_msec();
             dlist_detach(&conn->idle_node);
@@ -1067,8 +1120,6 @@ int main()
             // close the socket from socket error or application logic
             if ((ready & POLLERR) || conn->want_close)
             {
-                close(conn->fd);
-                g_data.fd2conn[conn->fd] = nullptr;
                 conn_destroy(conn);
             } // for each connection sockets
         }
