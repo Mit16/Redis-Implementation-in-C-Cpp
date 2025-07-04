@@ -206,12 +206,6 @@ static int32_t parse_req(const uint8_t *data, size_t size, vector<string> &out)
         }
     }
 
-    for (const auto &s : out)
-    {
-        fprintf(stderr, " '%s'", s.c_str());
-    }
-    fprintf(stderr, "\n");
-
     if (data != end)
     {
         return -1; // Trailing garbage
@@ -403,8 +397,6 @@ static void do_get(vector<string> &cmd, Buffer &out)
     Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_STR)
     {
-        fprintf(stderr, "[do_get] key=%s, type=%u\n", cmd[1].c_str(), ent->type);
-
         return out_err(out, ERR_BAD_TYP, "not a string value");
     }
     return out_str(out, ent->str.data(), ent->str.size());
@@ -425,8 +417,6 @@ static void do_set(vector<string> &cmd, Buffer &out)
         Entry *ent = container_of(node, Entry, node);
         if (ent->type != T_STR)
         {
-            fprintf(stderr, "[do_set] key=%s existing type=%u\n", cmd[1].c_str(), ent->type);
-
             return out_err(out, ERR_BAD_TYP, "a non-string value exists");
         }
         ent->str.swap(cmd[2]);
@@ -597,9 +587,6 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out)
     key.key = cmd[1]; // instead of swap(cmd[1])
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
-
-    fprintf(stderr, "[do_zadd] Adding to zset %s: name=%s, score=%f\n",
-            cmd[1].c_str(), cmd[3].c_str(), score);
 
     Entry *ent = NULL;
     if (!hnode)
@@ -846,6 +833,7 @@ static bool try_one_request(Conn *conn)
 
     // Process the command and generate a response
     size_t header_pos = 0;
+    conn->outgoing.clear();  // start fresh for new response
     response_begin(conn->outgoing, &header_pos);
     do_request(cmd, conn->outgoing);
     response_end(conn->outgoing, header_pos);
@@ -898,29 +886,38 @@ static void handle_read(Conn *conn)
 // Handle write events
 static void handle_write(Conn *conn)
 {
-    // Perform a non-blocking write
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-
-    if (rv < 0 && errno == EAGAIN)
+    while (!conn->outgoing.empty())
     {
-        return; // Not ready yet
-    }
-    if (rv < 0)
-    {
-        msg_errno("write() failed");
-        conn->want_close = true;
-        return;
+        ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
+        if (rv < 0)
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // Not ready yet; wait for next writable event
+                return;
+            }
+            else
+            {
+                msg_errno("write() failed");
+                conn->want_close = true;
+                return;
+            }
+        }
+
+        if (rv == 0)
+        {
+            // Should not happen, but defensively close
+            conn->want_close = true;
+            return;
+        }
+
+        buf_consume(conn->outgoing, rv);
     }
 
-    // Remove the written data from the outgoing buffer
-    buf_consume(conn->outgoing, rv);
-
-    // Update the connection state
-    if (conn->outgoing.size() == 0)
-    {
-        conn->want_write = false;
-        conn->want_read = true;
-    }
+    // All data written
+    conn->want_write = false;
+    conn->want_read = true;
 }
 
 const uint64_t k_idle_timeout_ms = 60 * 1000;
