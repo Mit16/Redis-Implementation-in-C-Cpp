@@ -11,10 +11,9 @@ TEST_SRC   = test_offset.cpp
 # Executables
 SERVER_BIN = server
 CLIENT_BIN = client
-CLIENT_DEBUG_BIN = client-debug
-TEST_BIN = test_offset
+TEST_BIN   = test_offset
 
-# Default target
+# Default target: build server and debug client
 all: $(SERVER_BIN) $(CLIENT_BIN)
 
 # Server build
@@ -22,15 +21,15 @@ $(SERVER_BIN): $(SERVER_SRC)
 	@echo "🔧 Building server..."
 	$(CXX) $(DEBUG_FLAGS) -o $@ $^
 
-# Production client (default)
+# Debug client build (default)
 $(CLIENT_BIN): $(CLIENT_SRC)
-	@echo "🔧 Building client (prod)..."
-	$(CXX) $(PROD_FLAGS) -o $@ $^
-
-# Debug build of client (named separately)
-$(CLIENT_DEBUG_BIN): $(CLIENT_SRC)
 	@echo "🐞 Building client (debug)..."
 	$(CXX) $(DEBUG_FLAGS) -o $@ $^
+
+# Optional: Production client (replaces same binary)
+client_prod: $(CLIENT_SRC)
+	@echo "🚀 Building client (prod)..."
+	$(CXX) $(PROD_FLAGS) -o $(CLIENT_BIN) $^
 
 # Test binary
 $(TEST_BIN): $(TEST_SRC)
@@ -40,15 +39,15 @@ $(TEST_BIN): $(TEST_SRC)
 # Test target
 test: $(TEST_BIN)
 
-# Python test runner
-testpy: $(CLIENT_BIN)
+# Python test runner (uses production client)
+testpy: client_prod
 	@echo "🐍 Running Python test_cmds.py with production client..."
 	python3 test_cmds.py
 
 # Clean up
 clean:
 	@echo "🧹 Cleaning up..."
-	rm -f $(SERVER_BIN) $(CLIENT_BIN) $(CLIENT_DEBUG_BIN) $(TEST_BIN)
+	rm -f $(SERVER_BIN) $(CLIENT_BIN) $(TEST_BIN)
 
 # Run targets
 run_server: $(SERVER_BIN)
@@ -56,11 +55,7 @@ run_server: $(SERVER_BIN)
 	./$<
 
 run_client: $(CLIENT_BIN)
-	@echo "🛰️  Running client (prod)..."
-	./$<
-
-run_client_debug: $(CLIENT_DEBUG_BIN)
-	@echo "🐞 Running client (debug)..."
+	@echo "🛰️  Running client..."
 	./$<
 
 run_test: test
